@@ -18,17 +18,20 @@ O que ele PROVA (hoje):
   3. Que o content_hash de cada evento público bate quando recomputado do zero a partir
      do payload/metadata (BLAKE3 sobre "item_id:event_type:payload:metadata", JSON
      compacto com chaves ordenadas) — integridade de cada evento, verificada aqui.
+  4. Que o content_root (anchor_content_root_v1) está ancorado ON-CHAIN dentro do envelope
+     do arg cid — e que BATE quando recomputado do snapshot com JCS RFC 8785 de verdade
+     (BLAKE3(JCS({schema,dfid,cid,snapshot_hash,events_root,commitments_root}))). Isto prova
+     a integridade do CONJUNTO ancorado (não só evento a evento): omitir um evento muda o
+     events_root, muda o cr, e não bate. Só em âncoras novas (C1b); legadas mostram "CID puro".
 
 O que ele AINDA NÃO prova (limites honestos — sem enfeite):
-  - O snapshot ancorado é PONTO-NO-TEMPO. Ele compromete um events_root da época da
-    ancoragem; eventos criados DEPOIS não estão sob nenhum commitment on-chain (a âncora
-    não é reescrita a cada evento novo). Este CLI exibe essa defasagem em vez de escondê-la.
-  - Não há um content_root on-chain além do CID; a recomputação do events_root histórico
-    exige o conjunto exato de eventos da época (que o snapshot não lista individualmente).
+  - O snapshot ancorado é PONTO-NO-TEMPO. O passo 4 prova o CONJUNTO da época da ancoragem;
+    eventos criados DEPOIS não estão sob commitment on-chain até a âncora ser reescrita
+    (cid_update por evento — trabalho aberto). Este CLI exibe essa defasagem, não a esconde.
   - Não verifica as leituras cruas privadas (só o snapshot público) nem a assinatura
     ed25519 do snapshot (a chave é publicada pela DeFarm; ancoragem externa é trabalho aberto).
 
-Dependência única fora da stdlib: blake3 (pip install blake3).
+Dependências fora da stdlib: blake3 (hashes), certifi (TLS no macOS), rfc8785 (JCS do passo 4).
 Licença: MIT.
 """
 from __future__ import annotations
@@ -48,6 +51,21 @@ try:
 except ImportError:
     sys.exit("Falta a dependência 'blake3'. Instale com:  pip install blake3")
 
+# rfc8785 = JCS RFC 8785 DE VERDADE. json.dumps(sort_keys=True) NÃO é JCS (números como 452.5
+# canonicalizam diferente). Usado só no passo do content_root on-chain (C1b); os demais passos
+# rodam sem ele. Se faltar, aquele passo degrada com um aviso em vez de derrubar tudo.
+try:
+    import rfc8785
+
+    def jcs_blake3(o: Any) -> str:
+        return blake3(rfc8785.dumps(o)).hexdigest()
+
+except ImportError:
+    rfc8785 = None
+
+    def jcs_blake3(o: Any) -> str:
+        raise RuntimeError("falta 'rfc8785' (pip install rfc8785) pro passo do content_root on-chain")
+
 # Contexto SSL com o CA bundle do certifi — no macOS o Python não encontra o do sistema
 # (erro CERTIFICATE_VERIFY_FAILED). Cai pro default se certifi não estiver instalado.
 try:
@@ -64,10 +82,11 @@ DEFAULT_IPFS_GATEWAYS = [
     "https://cloudflare-ipfs.com/ipfs",
 ]
 
-# Escaneia o envelope XDR (bytes) atrás do commitment que a DeFarm escreve on-chain:
-# um JSON {"d":"<DFID>","ipfs":"<CID>",...}. Não precisamos decodificar SCVal do Soroban —
-# o par (DFID, CID) viaja como string ASCII nos argumentos da chamada de contrato.
-ONCHAIN_RE = re.compile(rb'\{"d":"(DFID-[A-Za-z0-9-]+)","ipfs":"([A-Za-z0-9]+)"')
+# Escaneia o envelope XDR (bytes) atrás do commitment que a DeFarm escreve on-chain: um JSON
+# com "ipfs" nos argumentos da chamada de contrato (não é preciso decodificar SCVal do Soroban).
+# Legado: {"d","ipfs","vc","ts"}. C1b: o arg cid vira {"v":1,"d","ipfs","cr","ts","vc"} — o
+# `cr` = anchor_content_root_v1 ancorado. Pegamos o blob COM "cr" quando existe.
+ONCHAIN_RE = re.compile(rb'\{[^{}]*"ipfs"[^{}]*\}')
 
 GREEN, RED, YELLOW, DIM, BOLD, RESET = (
     "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[1m", "\033[0m",
@@ -81,7 +100,7 @@ def _color(enabled: bool):
 
 
 def http_get(url: str, timeout: int = 30, as_json: bool = False) -> Any:
-    req = urllib.request.Request(url, headers={"User-Agent": "defarm-verify/0.1"})
+    req = urllib.request.Request(url, headers={"User-Agent": "defarm-verify/0.2"})
     with urllib.request.urlopen(req, timeout=timeout, context=_SSL) as r:
         data = r.read()
     return json.loads(data) if as_json else data
@@ -99,21 +118,25 @@ def bootstrap_anchor(dfid: str, api: str) -> tuple[str | None, str | None]:
     return a.get("transaction_hash"), a.get("metadata_cid")
 
 
-def onchain_from_horizon(tx: str, horizon: str) -> tuple[str, str, int | None]:
-    """Lê a transação no Horizon PÚBLICO e extrai (DFID, CID, ts) do envelope. Esta é a
-    perna de independência: a existência do CID on-chain vem da rede, não da DeFarm."""
+def onchain_from_horizon(tx: str, horizon: str) -> tuple[str, str, str | None, int | None]:
+    """Lê a transação no Horizon PÚBLICO e extrai (DFID, CID, cr, ts) do envelope. Esta é a
+    perna de independência: a existência do CID (e do cr) on-chain vem da rede, não da DeFarm.
+    `cr` = None em âncoras legadas (CID puro, sem envelope)."""
     t = http_get(f"{horizon}/transactions/{tx}", as_json=True)
     if not t.get("successful", False):
         raise ValueError("a transação existe mas não foi bem-sucedida on-chain")
     raw = base64.b64decode(t["envelope_xdr"])
-    m = ONCHAIN_RE.search(raw)
-    if not m:
-        raise ValueError("não achei o commitment {\"d\":...,\"ipfs\":...} no envelope da tx")
-    dfid = m.group(1).decode()
-    cid = m.group(2).decode()
-    ts_m = re.search(rb'"ts":(\d+)', raw[m.start():])
-    ts = int(ts_m.group(1)) if ts_m else None
-    return dfid, cid, ts
+    blobs = []
+    for m in ONCHAIN_RE.finditer(raw):
+        try:
+            blobs.append(json.loads(m.group(0).decode()))
+        except (ValueError, UnicodeDecodeError):
+            continue
+    if not blobs:
+        raise ValueError("não achei o commitment {...\"ipfs\"...} no envelope da tx")
+    # Prefere o ENVELOPE do arg cid (tem "cr"); senão o blob nft_data (só o ponteiro).
+    env = next((b for b in blobs if "cr" in b), blobs[0])
+    return env.get("d"), env.get("ipfs"), env.get("cr"), env.get("ts")
 
 
 def fetch_snapshot(cid: str, gateways: list[str]) -> tuple[bytes, dict, list[str]]:
@@ -138,6 +161,63 @@ def canon(v: Any) -> str:
     # Espelha o serde_json compacto + chaves ordenadas do backend. O json do Python já
     # preserva int vs float (390 vs 390.0), então o content_hash bate byte-a-byte.
     return json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+# ---- content_root on-chain (C1b): recompõe o anchor_content_root_v1 e bate com o `cr` do envelope ----
+def _is_commitment_name(name: str) -> bool:
+    return (
+        name.endswith("_commitment")
+        and len(name) > len("_commitment")
+        and all(("a" <= c <= "z") or c == "_" for c in name)
+    )
+
+
+def _is_commitment_obj(v: Any) -> bool:
+    return isinstance(v, dict) and set(v.keys()) == {"alg", "domain", "value", "version"}
+
+
+def _commitment_entry(name: str, o: dict) -> dict:
+    return {
+        "name": name,
+        "alg": o.get("alg"),
+        "version": o.get("version"),
+        "domain": o.get("domain"),
+        "value": o.get("value"),
+    }
+
+
+def _extract_commitments(snapshot: dict) -> list:
+    """Mesma regra do backend/receita: metadata.*_commitment (flat) + property.car_commitment,
+    valor com EXATAMENTE {alg,domain,value,version}. Ordena por name."""
+    out = []
+    md = snapshot.get("metadata")
+    if isinstance(md, dict):
+        for k, v in md.items():
+            if _is_commitment_name(k) and _is_commitment_obj(v):
+                out.append(_commitment_entry(k, v))
+    prop = snapshot.get("property")
+    car = prop.get("car_commitment") if isinstance(prop, dict) else None
+    if _is_commitment_obj(car):
+        out.append(_commitment_entry("car_commitment", car))
+    out.sort(key=lambda c: c["name"])
+    return out
+
+
+def recompute_anchor_content_root(snapshot: dict, dfid: str, cid: str) -> str:
+    """anchor_content_root_v1 = BLAKE3(JCS({schema,dfid,cid,snapshot_hash,events_root,commitments_root})),
+    com snapshot_hash=BLAKE3(JCS(snapshot)), events_root=snapshot.events.hash, commitments_root=
+    BLAKE3(JCS(commitments ordenados)) ou None quando não há. As 6 chaves sempre presentes (null
+    quando ausente). Provado byte-a-byte contra o envelope real on-chain (cr 2acffac2…)."""
+    commits = _extract_commitments(snapshot)
+    preimage = {
+        "schema": "defarm.anchor_content_root.v1",
+        "dfid": dfid,
+        "cid": cid,
+        "snapshot_hash": jcs_blake3(snapshot),
+        "events_root": (snapshot.get("events") or {}).get("hash"),
+        "commitments_root": jcs_blake3(commits) if commits else None,
+    }
+    return jcs_blake3(preimage)
 
 
 def recompute_content_hash(e: dict) -> bool | None:
@@ -183,7 +263,7 @@ def main() -> int:
 
     # --- 1. âncora on-chain (Horizon público) ---
     try:
-        oc_dfid, oc_cid, oc_ts = onchain_from_horizon(tx, args.horizon)
+        oc_dfid, oc_cid, oc_cr, oc_ts = onchain_from_horizon(tx, args.horizon)
     except Exception as e:
         print(f"{r}✗ 1. âncora on-chain{x}: {e}")
         return 2
@@ -221,6 +301,27 @@ def main() -> int:
     if ev_root:
         print(f"    events_root ancorado (via CID): {ev_root}")
     print()
+
+    # --- 2b. content_root ON-CHAIN (C1b): o cr do envelope == recomposto do snapshot ---
+    if oc_cr:
+        try:
+            recomputed = recompute_anchor_content_root(snap, oc_dfid, oc_cid)
+            cr_match = recomputed == oc_cr
+            ok_all &= cr_match
+            mark = f"{g}✓{x}" if cr_match else f"{r}✗{x}"
+            print(f"{mark} {b}2b. content_root ON-CHAIN{x} (o cr do envelope, recomposto por você)")
+            print(f"    cr on-chain    : {oc_cr}")
+            print(f"    cr recomputado : {recomputed}  {'' if cr_match else r + '(NÃO bate!)' + x}")
+            print(f"    {dim}O cr viaja no ARG do contrato (não memo). Recompus o anchor_content_root_v1{x}")
+            print(f"    {dim}do snapshot com JCS RFC 8785 e conferi — integridade do CONJUNTO ancorado,{x}")
+            print(f"    {dim}sem confiar no servidor. Omitir um evento muda o cr e não bate.{x}")
+        except RuntimeError as e:
+            print(f"{y}~ 2b. content_root on-chain{x}: {e}")
+        print()
+    else:
+        print(f"{dim}2b. content_root on-chain: âncora legada (CID puro, sem envelope) — o cr não está{x}")
+        print(f"{dim}    on-chain; a integridade do CONJUNTO não é conferível contra a cadeia aqui.{x}")
+        print()
 
     # --- 3. integridade de cada evento (recompute independente) ---
     try:

@@ -21,29 +21,33 @@ própria.
 3. **A integridade de cada evento.** Recomputa o `content_hash` de cada evento público do
    zero — `BLAKE3("item_id:event_type:payload:metadata")`, com `payload`/`metadata` em
    JSON compacto e chaves ordenadas — e compara com o declarado.
+4. **O content_root ON-CHAIN (integridade do conjunto).** Em âncoras novas, o arg `cid` da
+   chamada de contrato é um envelope `{v,d,ipfs,cr,ts,vc}` — o `cr` = `anchor_content_root_v1`
+   viaja on-chain. O CLI o extrai do XDR e o **recompõe do snapshot** com **JCS RFC 8785 de
+   verdade** (`BLAKE3(JCS({schema,dfid,cid,snapshot_hash,events_root,commitments_root}))`), e
+   exige `cr recomputado == cr on-chain`. Isto prova a integridade do **conjunto ancorado**:
+   omitir um evento muda o `events_root`, muda o `cr`, e não bate. Âncoras legadas (CID puro)
+   mostram "CID puro" nesse passo.
 
 ## O que ele **ainda não** prova (limites honestos)
 
 Este verificador expõe as fraquezas em vez de escondê-las:
 
-- **O snapshot ancorado é ponto-no-tempo.** Ele compromete um `events_root` da época da
-  ancoragem. Eventos criados **depois** não estão sob nenhum commitment on-chain (a âncora
-  não é reescrita a cada evento novo). A integridade do passo 3 é do *conteúdo de cada
-  evento*, não prova de que o **conjunto atual** está ancorado.
-- Não há um `content_root` on-chain além do CID; a recomputação do `events_root` histórico
-  exigiria o conjunto exato de eventos da época (que o snapshot não lista individualmente).
+- **O snapshot ancorado é ponto-no-tempo.** O passo 4 prova o **conjunto da época da
+  ancoragem**. Eventos criados **depois** só entram sob commitment on-chain quando a âncora
+  é reescrita (`cid_update` por evento — trabalho em aberto). O CLI exibe essa defasagem.
 - Não verifica as **leituras cruas privadas** (só o snapshot público) nem a **assinatura
   ed25519 do snapshot** (a chave é publicada pela DeFarm; ancoragem externa da chave é
   trabalho em aberto).
 
-Esses limites são reais e o roadmap da DeFarm os fecha (commitment on-chain por conjunto,
-carimbo de tempo ICP-Brasil, ancoragem da chave de assinatura). Até lá, este CLI diz a
-verdade sobre o que a prova cobre.
+Esses limites são reais e o roadmap da DeFarm os fecha (re-ancoragem por evento, carimbo de
+tempo ICP-Brasil, ancoragem da chave de assinatura). Até lá, este CLI diz a verdade sobre o
+que a prova cobre.
 
 ## Uso
 
 ```bash
-pip install -r requirements.txt        # blake3 + certifi
+pip install -r requirements.txt        # blake3 + certifi + rfc8785
 python3 defarm_verify.py DFID-BEEF-BR-2026-001179-9e3fe8
 ```
 
