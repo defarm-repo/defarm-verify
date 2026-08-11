@@ -41,8 +41,40 @@ Este verificador expõe as fraquezas em vez de escondê-las:
   trabalho em aberto).
 
 Esses limites são reais e o roadmap da DeFarm os fecha (re-ancoragem por evento, carimbo de
-tempo ICP-Brasil, ancoragem da chave de assinatura). Até lá, este CLI diz a verdade sobre o
-que a prova cobre.
+tempo ICP-Brasil — ver `defarm_act.py` abaixo —, ancoragem da chave de assinatura). Até lá,
+este CLI diz a verdade sobre o que a prova cobre.
+
+## A terceira testemunha: carimbo de tempo RFC 3161 (`defarm_act.py`)
+
+A âncora on-chain (Stellar) prova **anterioridade pública**: aquele conteúdo existia quando o
+ledger fechou. Um **carimbo de tempo RFC 3161** de uma Autoridade de Carimbo do Tempo (TSA)
+acrescenta uma testemunha **independente** da blockchain — e, com uma ACT credenciada
+**ICP-Brasil**, uma data com **presunção legal** no Brasil (MP 2.200-2/2001).
+
+O desenho não carimba cada evento (custo variável). Carimba, **1 vez por dia**, uma **Merkle
+root SHA-256** das `content_root` confirmadas do dia (a `daily_root`); a prova de inclusão liga
+o `content_root` de cada item a essa root carimbada. Uma root, três testemunhas: a blockchain,
+o IPFS, e a TSA.
+
+`defarm_act.py` é a **referência + o verificador** desse mecanismo. Ele cria e confere um
+carimbo RFC 3161 sobre uma root, usando **só o padrão** (via `openssl ts`), não um validador
+proprietário — é o que um terceiro roda para validar a terceira testemunha sem a DeFarm:
+
+```bash
+# conferir um carimbo já emitido (o que um cético faz), 100% offline:
+python3 defarm_act.py --root-hex <sha256-da-daily-root> --token carimbo.tsr \
+    --ca cacert.pem --tsa-cert tsa.crt
+
+# provar o mecanismo ponta a ponta contra uma TSA pública (FreeTSA):
+python3 defarm_act.py --root-hex <sha256-hex> --tsa https://freetsa.org/tsr \
+    --ca-url https://freetsa.org/files/cacert.pem --tsa-cert-url https://freetsa.org/files/tsa.crt
+```
+
+A verificação confere três coisas: (1) o `messageImprint` do token é **exatamente**
+`SHA-256(daily_root)` — trocar a root reprova com *message imprint mismatch*; (2) a assinatura
+do token encadeia até a CA da TSA; (3) o `genTime` é a data atestada. O protocolo é idêntico na
+FreeTSA (teste) e numa ACT ICP-Brasil (produção) — muda só a cadeia de certificados. Requisito:
+`openssl` no PATH. (A emissão diária no servidor da DeFarm espelha esta mesma referência.)
 
 ## Uso
 
