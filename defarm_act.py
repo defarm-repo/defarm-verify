@@ -29,7 +29,9 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
+import json
 import re
 import ssl
 import subprocess
@@ -37,6 +39,12 @@ import sys
 import tempfile
 import urllib.request
 from pathlib import Path
+
+# Versões que este verificador SABE reproduzir. Um manifesto com valor diferente é RECUSADO cedo
+# (Hetzner #484): melhor recusar um alg desconhecido que calcular a árvore errada em silêncio.
+EXPECTED_BATCH_SCHEMA = "defarm.act_timestamp_batch.v1"
+EXPECTED_ROOT_ALG = "defarm.merkle-sha256-hextext.v1"
+EXPECTED_LEAF_SCHEMA = "defarm.act_timestamp_leaf.v1"
 
 try:
     import certifi
@@ -157,9 +165,105 @@ def verify_timestamp(root: bytes, token_der: bytes, ca_pem: bytes, tsa_cert_pem:
     }
 
 
+def verify_timestamp_digest(root_hex: str, token_der: bytes, ca_pem: bytes, tsa_cert_pem: bytes | None) -> dict:
+    """Verificação RFC 3161 no modo -DIGEST (o design do C2): a `daily_root` JÁ é o messageImprint,
+    então usa `-digest <root>`, NÃO `-data` (que re-hashearia a root → FAILED; o servidor manda o
+    imprint direto). Confere: imprint == root, assinatura, cadeia até a CA da TSA."""
+    info = token_info(token_der)
+    imprint_match = (info.get("imprint_hex") or "").lower() == root_hex.lower()
+    with tempfile.TemporaryDirectory() as td:
+        tf = Path(td) / "resp.tsr"
+        tf.write_bytes(token_der)
+        ca = Path(td) / "ca.pem"
+        ca.write_bytes(ca_pem)
+        args = ["openssl", "ts", "-verify", "-digest", root_hex, "-in", str(tf), "-CAfile", str(ca)]
+        if tsa_cert_pem:
+            unt = Path(td) / "tsa.crt"
+            unt.write_bytes(tsa_cert_pem)
+            args += ["-untrusted", str(unt)]
+        v = _run(args)
+    verified = v.returncode == 0 and b"Verification: OK" in (v.stdout + v.stderr)
+    return {
+        "ok": verified and imprint_match,
+        "chain_verified": verified,
+        "imprint_match": imprint_match,
+        "token_imprint": info.get("imprint_hex"),
+        "gen_time": info.get("gen_time"),
+        "policy_oid": info.get("policy_oid"),
+        "verify_output": (v.stdout + v.stderr).decode(errors="replace").strip(),
+    }
+
+
+def leaf_hash(leaf: dict) -> str:
+    """SHA-256(JCS(folha)). A folha é só-string, então JCS = json canônico (chaves ordenadas,
+    compacto, UTF-8) — bate byte-a-byte com o serde_jcs do servidor (provado na paridade do C2b)."""
+    jcs = json.dumps(leaf, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(jcs.encode()).hexdigest()
+
+
+def daily_root_from_leaves(leaves: list[dict]) -> str | None:
+    """Merkle-SHA256 sobre os leaf_hashes ORDENADOS: combine(l,r)=SHA-256(l++r hex COMO TEXTO), nó
+    ímpar duplica o último. Espelha `merkle_sha256_daily_root` do servidor (ROOT_ALG
+    defarm.merkle-sha256-hextext.v1). `None` = sem folha."""
+    level = sorted(leaf_hash(x) for x in leaves)
+    if not level:
+        return None
+    while len(level) > 1:
+        nxt = []
+        for i in range(0, len(level), 2):
+            left = level[i]
+            right = level[i + 1] if i + 1 < len(level) else left
+            nxt.append(hashlib.sha256((left + right).encode()).hexdigest())
+        level = nxt
+    return level[0]
+
+
+def verify_batch_manifest(manifest: dict, ca_pem: bytes, tsa_cert_pem: bytes | None) -> dict:
+    """A prova órfã COMPLETA do C2, a partir do manifesto IPFS (defarm.act_timestamp_batch.v1):
+      1. recusa cedo se schema/root_alg/leaf_schema forem desconhecidos (não sei reproduzir);
+      2. recompõe a daily_root das FOLHAS e confere == root declarada;
+      3. confere o carimbo RFC 3161 (modo -digest) sobre a root: imprint == root, assinatura, cadeia.
+    Se os três passam, a root está carimbada por uma TSA cuja cadeia confere — SEM a DeFarm."""
+    reasons: list[str] = []
+    if manifest.get("schema") != EXPECTED_BATCH_SCHEMA:
+        reasons.append(f"schema do manifesto desconhecido: {manifest.get('schema')!r}")
+    if manifest.get("root_alg") != EXPECTED_ROOT_ALG:
+        reasons.append(f"root_alg desconhecido (não sei reproduzir): {manifest.get('root_alg')!r}")
+    if manifest.get("leaf_schema") != EXPECTED_LEAF_SCHEMA:
+        reasons.append(f"leaf_schema desconhecido: {manifest.get('leaf_schema')!r}")
+    if reasons:
+        return {"ok": False, "reasons": reasons}
+
+    leaves = manifest.get("leaves", [])
+    declared = (manifest.get("root_hash_sha256") or "").lower()
+    recomputed = daily_root_from_leaves(leaves)
+    root_match = recomputed is not None and recomputed == declared
+    if not root_match:
+        reasons.append(f"daily_root recomputada das folhas ({recomputed}) != declarada ({declared})")
+
+    token_der = base64.b64decode(manifest.get("timestamp_token_b64", ""))
+    ts = verify_timestamp_digest(declared, token_der, ca_pem, tsa_cert_pem) if declared else {"ok": False}
+    if not ts.get("ok"):
+        reasons.append("carimbo RFC 3161 não confere: " + (ts.get("verify_output") or "imprint/cadeia"))
+
+    return {
+        "ok": root_match and ts.get("ok") and not reasons,
+        "reasons": reasons,
+        "recomputed_root": recomputed,
+        "declared_root": declared,
+        "root_match": root_match,
+        "leaf_count": len(leaves),
+        "gen_time": ts.get("gen_time"),
+        "provider": manifest.get("provider"),
+        "legal_profile": manifest.get("legal_profile"),
+        "policy_oid": ts.get("policy_oid"),
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Cria/verifica um carimbo de tempo RFC 3161 (ACT) sobre uma root.")
-    ap.add_argument("--root-hex", required=True, help="a daily_root em hex (será carimbada como SHA-256(root))")
+    ap.add_argument("--manifest", help="JSON do manifesto do lote (defarm.act_timestamp_batch.v1) — a prova órfã COMPLETA do C2: recompõe a daily_root das folhas + verifica o carimbo")
+    ap.add_argument("--root-hex", help="a daily_root em hex (modo carimbo único, sem manifesto)")
     ap.add_argument("--token", help="token DER já emitido (.tsr) — modo só-verificar")
     ap.add_argument("--tsa", help="URL da TSA p/ emitir (ex.: https://freetsa.org/tsr)")
     ap.add_argument("--ca", help="arquivo PEM da CA da TSA")
@@ -171,6 +275,37 @@ def main() -> int:
 
     g, r, y, dim, b, x = (GREEN, RED, YELLOW, DIM, BOLD, RESET) if (sys.stdout.isatty() and not args.no_color) else ("",) * 6
 
+    def _resolve_ca():
+        ca = Path(args.ca).read_bytes() if args.ca else (_http_get(args.ca_url) if args.ca_url else None)
+        cert = Path(args.tsa_cert).read_bytes() if args.tsa_cert else (_http_get(args.tsa_cert_url) if args.tsa_cert_url else None)
+        return ca, cert
+
+    # MODO MANIFESTO — a prova órfã COMPLETA do C2 (recompõe a daily_root das folhas + verifica o carimbo).
+    if args.manifest:
+        manifest = json.loads(Path(args.manifest).read_text())
+        ca_pem, tsa_cert = _resolve_ca()
+        if not ca_pem:
+            print(f"{r}informe a CA da TSA (--ca / --ca-url) p/ verificar a cadeia{x}")
+            return 2
+        print(f"{b}defarm-act{x}  —  manifesto {manifest.get('batch_date','?')} · {manifest.get('provider','?')} · {len(manifest.get('leaves',[]))} folhas")
+        res = verify_batch_manifest(manifest, ca_pem, tsa_cert)
+        mark = f"{g}✓{x}" if res.get("root_match") else f"{r}✗{x}"
+        print(f"{mark} recompus a daily_root das folhas e conferi com a declarada")
+        print(f"    declarada  : {res.get('declared_root')}")
+        print(f"    recomputada: {res.get('recomputed_root')}")
+        print(f"    carimbo    : genTime={res.get('gen_time')} · policy={res.get('policy_oid')} · perfil={res.get('legal_profile')}")
+        if res["ok"]:
+            print(f"{g}{b}VEREDITO:{x} as {res['leaf_count']} content_roots do dia estão carimbadas em "
+                  f"{res.get('gen_time')} — recomposto e verificado sem a DeFarm.")
+            return 0
+        for reason in res.get("reasons", []):
+            print(f"{r}  · {reason}{x}")
+        print(f"{r}{b}VEREDITO: o manifesto NÃO confere.{x}")
+        return 1
+
+    if not args.root_hex:
+        print(f"{r}informe --manifest <arquivo> ou --root-hex <hex>{x}")
+        return 2
     try:
         root = bytes.fromhex(args.root_hex.strip())
     except ValueError:

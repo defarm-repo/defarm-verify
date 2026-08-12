@@ -70,11 +70,30 @@ python3 defarm_act.py --root-hex <sha256-hex> --tsa https://freetsa.org/tsr \
     --ca-url https://freetsa.org/files/cacert.pem --tsa-cert-url https://freetsa.org/files/tsa.crt
 ```
 
-A verificação confere três coisas: (1) o `messageImprint` do token é **exatamente**
-`SHA-256(daily_root)` — trocar a root reprova com *message imprint mismatch*; (2) a assinatura
-do token encadeia até a CA da TSA; (3) o `genTime` é a data atestada. O protocolo é idêntico na
-FreeTSA (teste) e numa ACT ICP-Brasil (produção) — muda só a cadeia de certificados. Requisito:
-`openssl` no PATH. (A emissão diária no servidor da DeFarm espelha esta mesma referência.)
+A verificação confere: (1) o `messageImprint` do token é **exatamente** a `daily_root` — trocar a
+root reprova com *message imprint mismatch*; (2) a assinatura do token encadeia até a CA da TSA;
+(3) o `genTime` é a data atestada. O protocolo é idêntico na FreeTSA (teste) e numa ACT ICP-Brasil
+(produção) — muda só a cadeia de certificados. Requisito: `openssl` no PATH.
+
+### A prova completa: o manifesto do lote (o que roda em produção)
+
+Na prática o carimbo diário publica um **manifesto** no IPFS (`defarm.act_timestamp_batch.v1`) com
+as folhas do dia + o token embutido. Um terceiro baixa o manifesto e roda **uma prova órfã de uma
+tacada**:
+
+```bash
+python3 defarm_act.py --manifest lote.json --ca cacert.pem --tsa-cert tsa.crt
+```
+
+Isto faz, sem a DeFarm: (1) **recusa cedo** se o `root_alg`/`leaf_schema` forem desconhecidos (não
+recalcula uma árvore que não sabe reproduzir); (2) **recompõe a `daily_root`** das folhas (o mesmo
+Merkle-SHA256 do servidor) e confere == a root declarada — trocar uma folha muda a root e reprova;
+(3) **verifica o carimbo** sobre a root. O veredito é único: "as N content_roots do dia estão
+carimbadas em `<genTime>` — recomposto e verificado sem a DeFarm".
+
+> **`-digest`, não `-data`.** A `daily_root` já é um SHA-256 (é o próprio imprint), então a
+> verificação usa `openssl ts -verify -digest <root>`; um `-verify -data` re-hashearia a root e
+> reprovaria. Este é o modo do desenho do C2, e o que o `--manifest` faz por baixo.
 
 ## Uso
 
