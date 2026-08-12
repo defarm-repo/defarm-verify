@@ -218,6 +218,31 @@ def daily_root_from_leaves(leaves: list[dict]) -> str | None:
     return level[0]
 
 
+def token_cert_fingerprints(token_der: bytes) -> list[str]:
+    """Fingerprints SHA-256 (hex com ':', MAIÚSCULAS) de TODOS os certs DENTRO do token. O que o
+    manifesto DIZ (tsa_cert_fingerprint) tem de estar aqui — senão o campo é fabricado (Hetzner:
+    trocar o fingerprint por AA:AA:… não pode passar verde)."""
+    with tempfile.TemporaryDirectory() as td:
+        tsr = Path(td) / "resp.tsr"
+        tsr.write_bytes(token_der)
+        p7 = Path(td) / "tok.p7"
+        _run(["openssl", "ts", "-reply", "-in", str(tsr), "-token_out", "-out", str(p7)])
+        if not p7.exists():
+            return []
+        pem = (
+            _run(["openssl", "pkcs7", "-inform", "DER", "-in", str(p7), "-print_certs"])
+            .stdout.decode(errors="replace")
+        )
+    fps = []
+    for cert in re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", pem, re.S):
+        out = _run(
+            ["openssl", "x509", "-fingerprint", "-sha256", "-noout"], stdin=cert.encode()
+        ).stdout.decode(errors="replace").strip()
+        if "=" in out:
+            fps.append(out.split("=")[-1].strip().upper())
+    return fps
+
+
 def verify_batch_manifest(manifest: dict, ca_pem: bytes, tsa_cert_pem: bytes | None) -> dict:
     """A prova órfã COMPLETA do C2, a partir do manifesto IPFS (defarm.act_timestamp_batch.v1):
       1. recusa cedo se schema/root_alg/leaf_schema forem desconhecidos (não sei reproduzir);
@@ -246,12 +271,33 @@ def verify_batch_manifest(manifest: dict, ca_pem: bytes, tsa_cert_pem: bytes | N
     if not ts.get("ok"):
         reasons.append("carimbo RFC 3161 não confere: " + (ts.get("verify_output") or "imprint/cadeia"))
 
+    # sha256 do token DER declarado no manifesto tem de bater com os bytes de fato (o canário confere
+    # sem ir ao banco; aqui garante que o b64 não foi trocado sem atualizar o sha256).
+    declared_tok_sha = (manifest.get("timestamp_token_sha256") or "").lower()
+    token_sha_match = (not declared_tok_sha) or (hashlib.sha256(token_der).hexdigest() == declared_tok_sha)
+    if not token_sha_match:
+        reasons.append("timestamp_token_sha256 declarado != sha256 do token embutido")
+
+    # CONFRONTO do fingerprint (Hetzner): o tsa_cert_fingerprint DIZ qual cert; ele tem de estar
+    # DENTRO do token, senão é campo fabricado (trocar por AA:AA:… não pode passar verde).
+    claimed_fp = (manifest.get("tsa_cert_fingerprint") or "").upper().strip()
+    fp_match = None
+    if claimed_fp:
+        token_fps = token_cert_fingerprints(token_der)
+        fp_match = claimed_fp in token_fps
+        if not fp_match:
+            reasons.append(
+                f"tsa_cert_fingerprint do manifesto ({claimed_fp[:23]}…) NÃO está nos certs do token — fabricado"
+            )
+
     return {
-        "ok": root_match and ts.get("ok") and not reasons,
+        "ok": root_match and ts.get("ok") and token_sha_match and (fp_match is not False) and not reasons,
         "reasons": reasons,
         "recomputed_root": recomputed,
         "declared_root": declared,
         "root_match": root_match,
+        "token_sha_match": token_sha_match,
+        "fingerprint_match": fp_match,
         "leaf_count": len(leaves),
         "gen_time": ts.get("gen_time"),
         "provider": manifest.get("provider"),
@@ -284,11 +330,13 @@ def main() -> int:
     if args.manifest:
         manifest = json.loads(Path(args.manifest).read_text())
         ca_pem, tsa_cert = _resolve_ca()
+        ca_from_manifest = False
         # AUTO-SUFICIÊNCIA (Hetzner #487/F2): sem --ca, baixa a RAIZ da própria tsa_ca_url do
         # manifesto — o terceiro roda `--manifest lote.json` e pronto, sem saber a CA por fora.
         if not ca_pem and manifest.get("tsa_ca_url"):
             try:
                 ca_pem = _http_get(manifest["tsa_ca_url"])
+                ca_from_manifest = True
                 print(f"{dim}CA baixada do manifesto (tsa_ca_url): {manifest['tsa_ca_url']}{x}")
             except Exception as e:  # noqa: BLE001
                 print(f"{y}~ não baixei a CA de {manifest.get('tsa_ca_url')}: {e}{x}")
@@ -296,15 +344,25 @@ def main() -> int:
             print(f"{r}sem CA: nem --ca/--ca-url nem tsa_ca_url no manifesto{x}")
             return 2
         print(f"{b}defarm-act{x}  —  manifesto {manifest.get('batch_date','?')} · {manifest.get('provider','?')} · {len(manifest.get('leaves',[]))} folhas")
-        fp = manifest.get("tsa_cert_fingerprint")
-        if fp:
-            print(f"{dim}cert TSA esperado (fingerprint): {fp}{x}")
         res = verify_batch_manifest(manifest, ca_pem, tsa_cert)
         mark = f"{g}✓{x}" if res.get("root_match") else f"{r}✗{x}"
         print(f"{mark} recompus a daily_root das folhas e conferi com a declarada")
         print(f"    declarada  : {res.get('declared_root')}")
         print(f"    recomputada: {res.get('recomputed_root')}")
         print(f"    carimbo    : genTime={res.get('gen_time')} · policy={res.get('policy_oid')} · perfil={res.get('legal_profile')}")
+        # CONFRONTO do fingerprint (não só imprime): o campo do manifesto tem de bater com um cert DENTRO do token.
+        fpm = res.get("fingerprint_match")
+        if fpm is True:
+            print(f"    {g}✓{x} fingerprint do cert confere com um cert dentro do token")
+        elif fpm is False:
+            print(f"    {r}✗{x} fingerprint do manifesto NÃO está nos certs do token (fabricado)")
+        if res.get("token_sha_match") is False:
+            print(f"    {r}✗{x} timestamp_token_sha256 declarado != sha256 do token")
+        # RESSALVA estrutural (Hetzner): CA vinda do manifesto = ergonomia, não trustless (a DeFarm
+        # escreve o manifesto). Verificação trustless PINA a raiz por fora (--ca de fonte confiável).
+        if ca_from_manifest:
+            print(f"{y}    ~ CA veio do manifesto (ergonomia). Trustless = pinar a raiz por fora "
+                  f"(--ca de fonte confiável; no ICP-Brasil, a raiz por perfil legal).{x}")
         if res["ok"]:
             print(f"{g}{b}VEREDITO:{x} as {res['leaf_count']} content_roots do dia estão carimbadas em "
                   f"{res.get('gen_time')} — recomposto e verificado sem a DeFarm.")
