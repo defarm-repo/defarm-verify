@@ -341,26 +341,33 @@ def main() -> int:
         # Em --json, o stdout é SÓ o JSON (pro canário parsear); diagnósticos vão pro stderr.
         diag = (lambda m: print(m, file=sys.stderr)) if args.json else print
 
-        # Distingue "não conseguiu RODAR" (infra → retry) de "verificação FALHOU" (adulteração →
-        # alarme). Hetzner #488: o exit 1 estava sobrecarregado — manifesto ilegível dava exit 1 com
-        # stdout VAZIO, igual ao fingerprint fabricado; um canário que só olha o código gritaria
-        # "adulteração" num download truncado. Convenção:
-        #   exit 0 = verificado · exit 1 = FALHOU (ok:false, ALARME) · exit 2 = não-rodou (RETRY).
-        # Em --json, SEMPRE emite JSON no stdout, inclusive no erro (stdout vazio é o único caso que
-        # a máquina não interpreta).
-        def _fail_run(error_code: str, detail) -> int:
+        # Convenção de exit code (Hetzner #488): distingue "verificação FALHOU" (adulteração → ALARME,
+        # acorda gente) de "não conseguiu RODAR" (infra), e dentro deste, TRANSIENTE (retry) de
+        # PERMANENTE (não-retry — nenhuma tentativa conserta):
+        #   exit 0 = verificado
+        #   exit 1 = verificação FALHOU (ok:false, ALARME)
+        #   exit 2 = TRANSIENTE (retry: download truncado, rede)
+        #   exit 3 = PERMANENTE (não-retry: manifesto malformado, config/uso)
+        # Em --json, SEMPRE emite JSON no stdout, inclusive no erro (stdout vazio é o único caso que a
+        # máquina não interpreta — o estado proibido).
+        def _fail_run(error_code: str, detail, code: int = 2) -> int:
             if args.json:
                 print(json.dumps({"ok": False, "error": error_code, "detail": str(detail)[:300]}, ensure_ascii=False))
             else:
                 print(f"{r}[{error_code}] {detail}{x}")
-            return 2
+            return code
 
         try:
             manifest = json.loads(Path(args.manifest).read_text())
         except Exception as e:  # noqa: BLE001
-            return _fail_run("manifest_unreadable", e)
+            return _fail_run("manifest_unreadable", e, code=2)  # pode ser download truncado → retry
+        # JSON válido mas NÃO-objeto ([1,2,3], "x", 3): o loads passa e o tombo viria no 1º .get(),
+        # fora de proteção → stdout vazio (Hetzner #488). Uma linha fecha a porta.
+        if not isinstance(manifest, dict):
+            return _fail_run("manifest_not_object", f"JSON não é objeto ({type(manifest).__name__})", code=3)
         ca_pem, tsa_cert = _resolve_ca()
         ca_from_manifest = False
+        ca_fetch_error = None
         # AUTO-SUFICIÊNCIA (Hetzner #487/F2): sem --ca, baixa a RAIZ da própria tsa_ca_url do
         # manifesto — o terceiro roda `--manifest lote.json` e pronto, sem saber a CA por fora.
         if not ca_pem and manifest.get("tsa_ca_url"):
@@ -369,9 +376,12 @@ def main() -> int:
                 ca_from_manifest = True
                 diag(f"{dim}CA baixada do manifesto (tsa_ca_url): {manifest['tsa_ca_url']}{x}")
             except Exception as e:  # noqa: BLE001
+                ca_fetch_error = str(e)
                 diag(f"{y}~ não baixei a CA de {manifest.get('tsa_ca_url')}: {e}{x}")
         if not ca_pem:
-            return _fail_run("no_ca", "nem --ca/--ca-url nem tsa_ca_url no manifesto")
+            if ca_fetch_error:  # tinha ca_url mas a rede falhou → TRANSIENTE
+                return _fail_run("ca_fetch_failed", ca_fetch_error, code=2)
+            return _fail_run("no_ca", "nem --ca/--ca-url nem tsa_ca_url no manifesto", code=3)  # config → não-retry
         try:
             res = verify_batch_manifest(manifest, ca_pem, tsa_cert)
         except Exception as e:  # noqa: BLE001
@@ -419,8 +429,12 @@ def main() -> int:
         return 1
 
     if not args.root_hex:
-        print(f"{r}informe --manifest <arquivo> ou --root-hex <hex>{x}")
-        return 2
+        # Erro de INVOCAÇÃO (nem --manifest nem --root-hex): permanente, não-retry → exit 3, JSON.
+        if args.json:
+            print(json.dumps({"ok": False, "error": "usage", "detail": "informe --manifest ou --root-hex"}, ensure_ascii=False))
+        else:
+            print(f"{r}informe --manifest <arquivo> ou --root-hex <hex>{x}")
+        return 3
     try:
         root = bytes.fromhex(args.root_hex.strip())
     except ValueError:
