@@ -32,6 +32,7 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 import re
 import ssl
 import subprocess
@@ -58,8 +59,8 @@ GREEN, RED, YELLOW, DIM, BOLD, RESET = (
 )
 
 
-def _run(args: list[str], stdin: bytes | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(args, input=stdin, capture_output=True)
+def _run(args: list[str], stdin: bytes | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(args, input=stdin, capture_output=True, env=env)
 
 
 def _http_get(url: str) -> bytes:
@@ -96,7 +97,12 @@ def token_info(token_der: bytes) -> dict:
     with tempfile.TemporaryDirectory() as td:
         tf = Path(td) / "resp.tsr"
         tf.write_bytes(token_der)
-        out = _run(["openssl", "ts", "-reply", "-in", str(tf), "-text"])
+        # OPENSSL_CONF=/dev/null: sem o openssl.cnf do Debian, o Policy OID sai NUMÉRICO (1.2.3.4.1)
+        # em vez do alias (tsa_policy1) definido no oid_section daquele config. Sem isso o canário
+        # comparava 1.2.3.4.1 (DB) com tsa_policy1 (aqui) e reprovava 100% dos carimbos FreeTSA
+        # (Codex #494 F1). O -text só decodifica; o -verify usa -CAfile explícito, não precisa de config.
+        env = {**os.environ, "OPENSSL_CONF": os.devnull}
+        out = _run(["openssl", "ts", "-reply", "-in", str(tf), "-text"], env=env)
         text = out.stdout.decode(errors="replace")
     info: dict = {"gen_time": None, "imprint_hex": None, "policy_oid": None, "hash_alg": None}
     lines = text.splitlines()
