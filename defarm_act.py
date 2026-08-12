@@ -280,12 +280,20 @@ def verify_batch_manifest(manifest: dict, ca_pem: bytes, tsa_cert_pem: bytes | N
 
     # CONFRONTO do fingerprint (Hetzner): o tsa_cert_fingerprint DIZ qual cert; ele tem de estar
     # DENTRO do token, senão é campo fabricado (trocar por AA:AA:… não pode passar verde).
+    # LIMITE (Hetzner #488/frouxidão): isto prova "o cert ESTÁ no token", NÃO "o cert ASSINOU" —
+    # aceita qualquer um dos certs embutidos (assinante OU raiz). Com a FreeTSA o [0] é o assinante,
+    # mas o CMS não garante ordem; a resolução EXATA (casar pelo SignerInfo.sid dos dois lados) é
+    # tarefa do SERPRO, quando os certs podem vir fora de ordem. Por ora, reporta QUAL cert bateu.
     claimed_fp = (manifest.get("tsa_cert_fingerprint") or "").upper().strip()
     fp_match = None
+    fp_cert_index = None
     if claimed_fp:
         token_fps = token_cert_fingerprints(token_der)
-        fp_match = claimed_fp in token_fps
-        if not fp_match:
+        if claimed_fp in token_fps:
+            fp_match = True
+            fp_cert_index = token_fps.index(claimed_fp)
+        else:
+            fp_match = False
             reasons.append(
                 f"tsa_cert_fingerprint do manifesto ({claimed_fp[:23]}…) NÃO está nos certs do token — fabricado"
             )
@@ -298,6 +306,7 @@ def verify_batch_manifest(manifest: dict, ca_pem: bytes, tsa_cert_pem: bytes | N
         "root_match": root_match,
         "token_sha_match": token_sha_match,
         "fingerprint_match": fp_match,
+        "fingerprint_cert_index": fp_cert_index,
         "leaf_count": len(leaves),
         "gen_time": ts.get("gen_time"),
         "provider": manifest.get("provider"),
@@ -353,7 +362,10 @@ def main() -> int:
         # CONFRONTO do fingerprint (não só imprime): o campo do manifesto tem de bater com um cert DENTRO do token.
         fpm = res.get("fingerprint_match")
         if fpm is True:
-            print(f"    {g}✓{x} fingerprint do cert confere com um cert dentro do token")
+            idx = res.get("fingerprint_cert_index")
+            print(f"    {g}✓{x} fingerprint declarado bate o cert[{idx}] DENTRO do token")
+            print(f"{dim}      (prova que o cert ESTÁ no token, não que ASSINOU; a resolução exata pelo "
+                  f"SignerInfo.sid é tarefa do SERPRO — o CMS não garante ordem dos certs){x}")
         elif fpm is False:
             print(f"    {r}✗{x} fingerprint do manifesto NÃO está nos certs do token (fabricado)")
         if res.get("token_sha_match") is False:
