@@ -326,6 +326,7 @@ def main() -> int:
     ap.add_argument("--tsa-cert", help="arquivo do cert intermediário da TSA (untrusted)")
     ap.add_argument("--tsa-cert-url", help="URL do cert intermediário da TSA")
     ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--json", action="store_true", help="saída JSON do resultado (pro canário/C2b-2d fixar o índice esperado por provedor); exit 0/1 igual")
     args = ap.parse_args()
 
     g, r, y, dim, b, x = (GREEN, RED, YELLOW, DIM, BOLD, RESET) if (sys.stdout.isatty() and not args.no_color) else ("",) * 6
@@ -337,6 +338,8 @@ def main() -> int:
 
     # MODO MANIFESTO — a prova órfã COMPLETA do C2 (recompõe a daily_root das folhas + verifica o carimbo).
     if args.manifest:
+        # Em --json, o stdout é SÓ o JSON (pro canário parsear); diagnósticos vão pro stderr.
+        diag = (lambda m: print(m, file=sys.stderr)) if args.json else print
         manifest = json.loads(Path(args.manifest).read_text())
         ca_pem, tsa_cert = _resolve_ca()
         ca_from_manifest = False
@@ -346,14 +349,25 @@ def main() -> int:
             try:
                 ca_pem = _http_get(manifest["tsa_ca_url"])
                 ca_from_manifest = True
-                print(f"{dim}CA baixada do manifesto (tsa_ca_url): {manifest['tsa_ca_url']}{x}")
+                diag(f"{dim}CA baixada do manifesto (tsa_ca_url): {manifest['tsa_ca_url']}{x}")
             except Exception as e:  # noqa: BLE001
-                print(f"{y}~ não baixei a CA de {manifest.get('tsa_ca_url')}: {e}{x}")
+                diag(f"{y}~ não baixei a CA de {manifest.get('tsa_ca_url')}: {e}{x}")
         if not ca_pem:
-            print(f"{r}sem CA: nem --ca/--ca-url nem tsa_ca_url no manifesto{x}")
+            diag(f"{r}sem CA: nem --ca/--ca-url nem tsa_ca_url no manifesto{x}")
             return 2
-        print(f"{b}defarm-act{x}  —  manifesto {manifest.get('batch_date','?')} · {manifest.get('provider','?')} · {len(manifest.get('leaves',[]))} folhas")
         res = verify_batch_manifest(manifest, ca_pem, tsa_cert)
+        if args.json:
+            # Máquina (canário/C2b-2d): resultado estruturado — inclui fingerprint_cert_index (fixar
+            # o esperado por provedor: freetsa→0; alertar se mudar = surpresa de ordenação do SERPRO)
+            # e ca_from_manifest (ergonomia vs trustless). exit 0/1 igual ao modo humano.
+            print(json.dumps({
+                **res,
+                "batch_date": manifest.get("batch_date"),
+                "provider": manifest.get("provider"),
+                "ca_from_manifest": ca_from_manifest,
+            }, ensure_ascii=False))
+            return 0 if res["ok"] else 1
+        print(f"{b}defarm-act{x}  —  manifesto {manifest.get('batch_date','?')} · {manifest.get('provider','?')} · {len(manifest.get('leaves',[]))} folhas")
         mark = f"{g}✓{x}" if res.get("root_match") else f"{r}✗{x}"
         print(f"{mark} recompus a daily_root das folhas e conferi com a declarada")
         print(f"    declarada  : {res.get('declared_root')}")
