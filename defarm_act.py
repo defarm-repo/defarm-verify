@@ -357,10 +357,17 @@ def main() -> int:
                 print(f"{r}[{error_code}] {detail}{x}")
             return code
 
+        # DECISÃO DELIBERATA (Hetzner #488): FileNotFoundError E JSONDecodeError colapsam em
+        # manifest_unreadable/exit 2 (TRANSIENTE → retry), de propósito. No consumidor primário — o
+        # canário baixa do IPFS pro temporário, depois verifica — um arquivo ausente ali é quase
+        # sempre DOWNLOAD FALHO (retry certo), não caminho errado. Separar FileNotFoundError pra exit
+        # 3 (permanente) faria o canário PARAR de retentar um download que falhou — o oposto do certo.
+        # O caso "humano typa o path" (permanente de verdade) é raro e o retry-com-teto do canário o
+        # escala. O `detail` diz qual foi, mas canário não casa regex em mensagem de exceção.
         try:
             manifest = json.loads(Path(args.manifest).read_text())
         except Exception as e:  # noqa: BLE001
-            return _fail_run("manifest_unreadable", e, code=2)  # pode ser download truncado → retry
+            return _fail_run("manifest_unreadable", e, code=2)
         # JSON válido mas NÃO-objeto ([1,2,3], "x", 3): o loads passa e o tombo viria no 1º .get(),
         # fora de proteção → stdout vazio (Hetzner #488). Uma linha fecha a porta.
         if not isinstance(manifest, dict):
