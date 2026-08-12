@@ -284,10 +284,21 @@ def main() -> int:
     if args.manifest:
         manifest = json.loads(Path(args.manifest).read_text())
         ca_pem, tsa_cert = _resolve_ca()
+        # AUTO-SUFICIÊNCIA (Hetzner #487/F2): sem --ca, baixa a RAIZ da própria tsa_ca_url do
+        # manifesto — o terceiro roda `--manifest lote.json` e pronto, sem saber a CA por fora.
+        if not ca_pem and manifest.get("tsa_ca_url"):
+            try:
+                ca_pem = _http_get(manifest["tsa_ca_url"])
+                print(f"{dim}CA baixada do manifesto (tsa_ca_url): {manifest['tsa_ca_url']}{x}")
+            except Exception as e:  # noqa: BLE001
+                print(f"{y}~ não baixei a CA de {manifest.get('tsa_ca_url')}: {e}{x}")
         if not ca_pem:
-            print(f"{r}informe a CA da TSA (--ca / --ca-url) p/ verificar a cadeia{x}")
+            print(f"{r}sem CA: nem --ca/--ca-url nem tsa_ca_url no manifesto{x}")
             return 2
         print(f"{b}defarm-act{x}  —  manifesto {manifest.get('batch_date','?')} · {manifest.get('provider','?')} · {len(manifest.get('leaves',[]))} folhas")
+        fp = manifest.get("tsa_cert_fingerprint")
+        if fp:
+            print(f"{dim}cert TSA esperado (fingerprint): {fp}{x}")
         res = verify_batch_manifest(manifest, ca_pem, tsa_cert)
         mark = f"{g}✓{x}" if res.get("root_match") else f"{r}✗{x}"
         print(f"{mark} recompus a daily_root das folhas e conferi com a declarada")
