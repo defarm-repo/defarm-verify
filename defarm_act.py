@@ -340,7 +340,25 @@ def main() -> int:
     if args.manifest:
         # Em --json, o stdout é SÓ o JSON (pro canário parsear); diagnósticos vão pro stderr.
         diag = (lambda m: print(m, file=sys.stderr)) if args.json else print
-        manifest = json.loads(Path(args.manifest).read_text())
+
+        # Distingue "não conseguiu RODAR" (infra → retry) de "verificação FALHOU" (adulteração →
+        # alarme). Hetzner #488: o exit 1 estava sobrecarregado — manifesto ilegível dava exit 1 com
+        # stdout VAZIO, igual ao fingerprint fabricado; um canário que só olha o código gritaria
+        # "adulteração" num download truncado. Convenção:
+        #   exit 0 = verificado · exit 1 = FALHOU (ok:false, ALARME) · exit 2 = não-rodou (RETRY).
+        # Em --json, SEMPRE emite JSON no stdout, inclusive no erro (stdout vazio é o único caso que
+        # a máquina não interpreta).
+        def _fail_run(error_code: str, detail) -> int:
+            if args.json:
+                print(json.dumps({"ok": False, "error": error_code, "detail": str(detail)[:300]}, ensure_ascii=False))
+            else:
+                print(f"{r}[{error_code}] {detail}{x}")
+            return 2
+
+        try:
+            manifest = json.loads(Path(args.manifest).read_text())
+        except Exception as e:  # noqa: BLE001
+            return _fail_run("manifest_unreadable", e)
         ca_pem, tsa_cert = _resolve_ca()
         ca_from_manifest = False
         # AUTO-SUFICIÊNCIA (Hetzner #487/F2): sem --ca, baixa a RAIZ da própria tsa_ca_url do
@@ -353,9 +371,11 @@ def main() -> int:
             except Exception as e:  # noqa: BLE001
                 diag(f"{y}~ não baixei a CA de {manifest.get('tsa_ca_url')}: {e}{x}")
         if not ca_pem:
-            diag(f"{r}sem CA: nem --ca/--ca-url nem tsa_ca_url no manifesto{x}")
-            return 2
-        res = verify_batch_manifest(manifest, ca_pem, tsa_cert)
+            return _fail_run("no_ca", "nem --ca/--ca-url nem tsa_ca_url no manifesto")
+        try:
+            res = verify_batch_manifest(manifest, ca_pem, tsa_cert)
+        except Exception as e:  # noqa: BLE001
+            return _fail_run("verify_crashed", e)
         if args.json:
             # Máquina (canário/C2b-2d): resultado estruturado — inclui fingerprint_cert_index (fixar
             # o esperado por provedor: freetsa→0; alertar se mudar = surpresa de ordenação do SERPRO)
