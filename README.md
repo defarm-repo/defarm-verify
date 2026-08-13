@@ -95,6 +95,34 @@ carimbadas em `<genTime>` — recomposto e verificado sem a DeFarm".
 > verificação usa `openssl ts -verify -digest <root>`; um `-verify -data` re-hashearia a root e
 > reprovaria. Este é o modo do desenho do C2, e o que o `--manifest` faz por baixo.
 
+## O carimbo de tempo das ASSINATURAS (`defarm_sig_ts.py`) — N1 D3
+
+A mesma testemunha de tempo, agora sobre as **assinaturas anexadas** (não sobre a `content_root`):
+cada assinatura verificada do dia vira uma folha, as folhas formam uma `signature_root` (a **mesma
+árvore** Merkle-SHA256, outro `root_domain`), a root é carimbada 1×/dia por uma TSA. O `/verify`
+publica, por assinatura, um `trusted_timestamp` (estado + prova de inclusão + o ACT).
+
+`defarm_sig_ts.py` é o **canário**: pega um `/verify` e, para cada assinatura, prova sem a DeFarm —
+
+1. recompõe o `leaf_hash` **só** dos campos publicados e confere == `proof.leaf_hash` (byte-exatidão);
+2. sobe a `inclusion_proof` (position+siblings) até `proof.root_hash_sha256` (esta folha está na root);
+3. baixa o manifesto no IPFS (`proof.act.timestamp_token_cid`), recompõe a root inteira das folhas e
+   **verifica o carimbo RFC 3161** (`openssl ts -verify -digest`, cadeia até a CA — a mesma prova do
+   `defarm_act.py`, reusada); e confere que a root do `/verify` == a root do manifesto.
+
+```bash
+# de um /verify já baixado (reproduzível, sem re-tocar a API):
+python3 defarm_sig_ts.py --verify-json verify.json
+
+# de uma URL, em modo JSON (para um cron/monitor):
+python3 defarm_sig_ts.py --verify-url https://.../api/verify/<DFID> --json
+```
+
+> **Alarme, não silêncio.** Uma assinatura `materialized_pending_stamp` há **mais** que
+> `--max-pending-days` (default 3 = margem + cadência diária + folga) não é pendência normal — é um
+> dia que **não carimbou** (worker parado, ou a margem subida em produção). O canário **sai `!= 0`**
+> nesse caso, para um monitor gritar em vez de "pendente há 3 dias" parecer normal.
+
 ## Uso
 
 ```bash
