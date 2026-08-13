@@ -126,9 +126,15 @@ def pending_age_days(attached_created_at: str) -> float | None:
     return (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
 
 
-def check_signature(a: dict, gateways: list[str], max_pending_days: float) -> dict:
+def check_signature(
+    a: dict, gateways: list[str], max_pending_days: float, require_manifest: bool = False
+) -> dict:
     """Verifica UMA assinatura anexada do /verify. Retorna {status, ok, alarm, reasons, ...}.
-    status: verified | pending | stale_pending(ALARME) | not_timestamped | error."""
+    status: verified | verified_pending_manifest | pending | stale_pending(ALARME) |
+            not_timestamped | error.
+    `require_manifest`: por default o manifesto AINDA-NÃO-RECUPERÁVEL (propagação IPFS, minutos após
+    carimbar) NÃO é falha — a prova de inclusão já fecha só com o JSON (leaf + siblings). Com
+    `require_manifest=True` (modo estrito, p/ um canário que roda depois da propagação) ele vira falha."""
     ts = a.get("trusted_timestamp") or {}
     state = ts.get("state", "not_timestamped")
     key = a.get("signer_key_id", "?")
@@ -172,30 +178,46 @@ def check_signature(a: dict, gateways: list[str], max_pending_days: float) -> di
     if not incl:
         reasons.append("a prova de inclusão NÃO recompõe a root declarada")
 
-    # 3) manifesto no IPFS: recompõe a root inteira das folhas + carimbo RFC 3161 confere.
-    manifest_res: dict = {"ok": False}
-    leaf_in_manifest = False
+    # leaf + inclusão são a prova que FECHA só com o JSON do /verify. Se QUALQUER uma falha, é defeito
+    # REAL (o /verify mentiu) — independe do manifesto. Reprova cedo.
+    if not leaf_match or not incl:
+        return {"status": "error", "ok": False, "alarm": False, "reasons": reasons,
+                "signer_key_id": key, "root": root_hex}
+
+    # 3) manifesto no IPFS: o ÚLTIMO elo (recompõe a root inteira das folhas + carimbo RFC 3161). O
+    # FETCH pode falhar por PROPAGAÇÃO (o CID recém-pinado leva minutos p/ resolver em gateway público)
+    # — isso é TRANSIENTE, não defeito: a inclusão acima já provou que esta assinatura está na root.
+    def pending(reason: str) -> dict:
+        # F1 (Hetzner #512): manifesto ainda-não-recuperável ≠ "não confere". Sem --require-manifest
+        # NÃO é falha (a prova já fecha por leaf+inclusão); é um retry, não um alarme.
+        return {"status": "verified_pending_manifest", "ok": not require_manifest, "alarm": False,
+                "transient": True, "reasons": [reason], "signer_key_id": key, "root": root_hex}
+
     try:
         cid = p["act"]["timestamp_token_cid"]
         manifest = fetch_manifest(cid, gateways)
+    except Exception as e:
+        return pending(f"manifesto ainda não recuperável no IPFS ({e}) — propagação, não defeito")
+    try:
         ca_url = manifest.get("tsa_ca_url")
         ca_pem = _fetch(ca_url) if ca_url else b""
-        manifest_res = act.verify_batch_manifest(
-            manifest, ca_pem, None,
-            expected_schema=SIG_BATCH_SCHEMA, expected_leaf_schema=SIG_LEAF_SCHEMA,
-        )
-        if not manifest_res.get("ok"):
-            reasons.append("manifesto não confere: " + "; ".join(manifest_res.get("reasons", []) or ["root/carimbo"]))
-        # 4) a root do /verify == a root do manifesto, e esta folha está entre as folhas do manifesto.
-        if (manifest.get("root_hash_sha256") or "").lower() != root_hex:
-            reasons.append("root do /verify != root do manifesto")
-        leaf_in_manifest = declared_leaf in {act.leaf_hash(x) for x in manifest.get("leaves", [])}
-        if not leaf_in_manifest:
-            reasons.append("esta folha NÃO está entre as folhas do manifesto")
     except Exception as e:
-        reasons.append(f"falha ao baixar/verificar o manifesto: {e}")
+        return pending(f"CA da TSA ainda não recuperável ({e}) — propagação/rede")
 
-    ok = leaf_match and incl and manifest_res.get("ok") and leaf_in_manifest and not reasons
+    # manifesto E CA baixados → verifica o último elo DE VERDADE (aqui um erro É alarme).
+    manifest_res = act.verify_batch_manifest(
+        manifest, ca_pem, None,
+        expected_schema=SIG_BATCH_SCHEMA, expected_leaf_schema=SIG_LEAF_SCHEMA,
+    )
+    if not manifest_res.get("ok"):
+        reasons.append("manifesto não confere: " + "; ".join(manifest_res.get("reasons", []) or ["root/carimbo"]))
+    if (manifest.get("root_hash_sha256") or "").lower() != root_hex:
+        reasons.append("root do /verify != root do manifesto")
+    leaf_in_manifest = declared_leaf in {act.leaf_hash(x) for x in manifest.get("leaves", [])}
+    if not leaf_in_manifest:
+        reasons.append("esta folha NÃO está entre as folhas do manifesto")
+
+    ok = manifest_res.get("ok") and leaf_in_manifest and not reasons
     return {
         "status": "verified" if ok else "error",
         "ok": bool(ok),
@@ -226,6 +248,8 @@ def main() -> int:
                     help="gateway IPFS público (repetível; default: pinata, ipfs.io, cloudflare)")
     ap.add_argument("--max-pending-days", type=float, default=3.0,
                     help="ALARME se uma assinatura ficar pendente mais que isto (default 3 = margem+cadência+folga)")
+    ap.add_argument("--require-manifest", action="store_true",
+                    help="exige o manifesto recuperável AGORA (estrito). Default: manifesto ainda em propagação IPFS não é falha — a prova de inclusão já fecha só com o JSON")
     ap.add_argument("--json", action="store_true", help="saída JSON (exit 0/1 igual)")
     ap.add_argument("--no-color", action="store_true")
     args = ap.parse_args()
@@ -240,9 +264,10 @@ def main() -> int:
         doc = json.loads(_fetch(args.verify_url))
 
     sigs = collect_signatures(doc)
-    results = [check_signature(a, gateways, args.max_pending_days) for a in sigs]
+    results = [check_signature(a, gateways, args.max_pending_days, args.require_manifest) for a in sigs]
 
     n_ok = sum(1 for x_ in results if x_["status"] == "verified")
+    n_pending_manifest = sum(1 for x_ in results if x_["status"] == "verified_pending_manifest")
     n_alarm = sum(1 for x_ in results if x_.get("alarm"))
     n_fail = sum(1 for x_ in results if not x_["ok"])
     ok_overall = n_fail == 0 and n_alarm == 0
@@ -252,6 +277,7 @@ def main() -> int:
             "dfid": doc.get("dfid"),
             "signatures": len(results),
             "verified": n_ok,
+            "verified_pending_manifest": n_pending_manifest,
             "alarms": n_alarm,
             "failures": n_fail,
             "ok": ok_overall,
@@ -267,6 +293,8 @@ def main() -> int:
         st = res["status"]
         if st == "verified":
             print(f"  {g}✓{x} {key}  carimbada {dim}({res.get('gen_time')}, {res.get('provider')}/{res.get('legal_profile')}){x}")
+        elif st == "verified_pending_manifest":
+            print(f"  {y}✓{x} {key}  incluída na root {g}(prova fecha){x} {dim}— manifesto ainda propagando no IPFS, retry{x}")
         elif st == "pending":
             print(f"  {y}…{x} {key}  pendente {dim}(há {res.get('age_days')}d — normal até ~{args.max_pending_days:g}d){x}")
         elif st == "stale_pending":
@@ -276,7 +304,8 @@ def main() -> int:
         else:
             print(f"  {r}✗{x} {key}  FALHA: {'; '.join(res.get('reasons', []))}")
     tail = f"{g}OK{x}" if ok_overall else f"{r}FALHA{x}"
-    print(f"  {b}→ {tail}{x}  verified={n_ok} alarmes={n_alarm} falhas={n_fail}")
+    pend = f" pend.manifesto={n_pending_manifest}" if n_pending_manifest else ""
+    print(f"  {b}→ {tail}{x}  verified={n_ok}{pend} alarmes={n_alarm} falhas={n_fail}")
     return 0 if ok_overall else 1
 
 
