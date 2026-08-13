@@ -190,7 +190,12 @@ def check_signature(
     # minutos; um manifesto inalcançável há DIAS (> max_pending_days) é PIN PERDIDO, não propagação →
     # vira ALARME (exit != 0), senão "pending para sempre" repete o silêncio do #509 no último elo.
     def pending(reason: str) -> dict:
-        age = pending_age_days(a.get("attached_created_at", ""))
+        # A idade do PIN, NÃO a do anexo (Hetzner #3): o manifesto é pinado QUANDO a root é carimbada,
+        # então a janela de propagação conta do `proof.act.issued_at` (genTime do carimbo) — publicado
+        # no /verify, FORA da folha. Usar `attached_created_at` daria 73d p/ um pin de 7s num
+        # backfill/replay (assinatura antiga carimbada hoje). O issued_at é o relógio do pin.
+        issued = (p.get("act") or {}).get("issued_at", "")
+        age = pending_age_days(issued)
         if age is not None and age > max_pending_days:
             return {"status": "stale_pending_manifest", "ok": False, "alarm": True,
                     "age_days": round(age, 2),
@@ -312,7 +317,8 @@ def main() -> int:
         if st == "verified":
             print(f"  {g}✓{x} {key}  carimbada {dim}({res.get('gen_time')}, {res.get('provider')}/{res.get('legal_profile')}){x}")
         elif st == "verified_pending_manifest":
-            print(f"  {y}✓{x} {key}  incluída na root {g}(prova fecha){x} {dim}— manifesto ainda propagando no IPFS, retry{x}")
+            why = (res.get("reasons") or ["último elo ainda propagando"])[0]
+            print(f"  {y}✓{x} {key}  incluída na root {g}(prova fecha){x} {dim}— {why}, retry{x}")
         elif st == "stale_pending_manifest":
             print(f"  {r}!{x} {key}  {r}ALARME{x}: manifesto inalcançável há {res.get('age_days')}d — pin perdido, não propagação")
         elif st == "pending":

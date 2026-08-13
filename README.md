@@ -129,6 +129,12 @@ python3 defarm_sig_ts.py --verify-url https://.../api/verify/<DFID> --json
 > (`✓ incluída na root`) e **NÃO sai `!= 0`** — o último elo (recompor a root inteira + `openssl`) é um
 > **retry**, não um alarme. Um canário que grita por propagação vira ruído. Para exigir o manifesto
 > recuperável AGORA (canário estrito, rodado depois da propagação), passe `--require-manifest`.
+>
+> **Ressalva — o transiente tem TETO.** Propagação é minutos; um manifesto inalcançável há **mais** que
+> `--max-pending-days` **não** é propagação, é **pin perdido** → o canário reporta `stale_pending_manifest`
+> e **sai `!= 0`** (senão "pendente para sempre" repete o silêncio no último elo). A idade é a do **PIN**
+> (`proof.act.issued_at`, o genTime do carimbo), NÃO a do anexo — um pin de 7 s de uma assinatura
+> antiga (backfill/replay) segue transiente, não vira falso alarme.
 
 ## Uso
 
