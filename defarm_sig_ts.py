@@ -179,49 +179,67 @@ def check_signature(
         reasons.append("a prova de inclusão NÃO recompõe a root declarada")
 
     # leaf + inclusão são a prova que FECHA só com o JSON do /verify. Se QUALQUER uma falha, é defeito
-    # REAL (o /verify mentiu) — independe do manifesto. Reprova cedo.
+    # REAL (o /verify mentiu) — independe do manifesto. Reprova cedo, com ALARME.
     if not leaf_match or not incl:
-        return {"status": "error", "ok": False, "alarm": False, "reasons": reasons,
+        return {"status": "error", "ok": False, "alarm": True, "reasons": reasons,
                 "signer_key_id": key, "root": root_hex}
 
-    # 3) manifesto no IPFS: o ÚLTIMO elo (recompõe a root inteira das folhas + carimbo RFC 3161). O
-    # FETCH pode falhar por PROPAGAÇÃO (o CID recém-pinado leva minutos p/ resolver em gateway público)
-    # — isso é TRANSIENTE, não defeito: a inclusão acima já provou que esta assinatura está na root.
+    # 3) manifesto no IPFS: o ÚLTIMO elo. O FETCH pode falhar por PROPAGAÇÃO (o CID recém-pinado leva
+    # minutos p/ resolver em gateway público) — TRANSIENTE, não defeito: a inclusão acima já provou que
+    # esta assinatura está na root. MAS o transiente tem TETO (Hetzner #3, achado 2): propagação é
+    # minutos; um manifesto inalcançável há DIAS (> max_pending_days) é PIN PERDIDO, não propagação →
+    # vira ALARME (exit != 0), senão "pending para sempre" repete o silêncio do #509 no último elo.
     def pending(reason: str) -> dict:
-        # F1 (Hetzner #512): manifesto ainda-não-recuperável ≠ "não confere". Sem --require-manifest
-        # NÃO é falha (a prova já fecha por leaf+inclusão); é um retry, não um alarme.
+        age = pending_age_days(a.get("attached_created_at", ""))
+        if age is not None and age > max_pending_days:
+            return {"status": "stale_pending_manifest", "ok": False, "alarm": True,
+                    "age_days": round(age, 2),
+                    "reasons": [f"{reason} — há {round(age, 2)}d (> {max_pending_days:g}d): não é propagação, é pin perdido"],
+                    "signer_key_id": key, "root": root_hex}
         return {"status": "verified_pending_manifest", "ok": not require_manifest, "alarm": False,
-                "transient": True, "reasons": [reason], "signer_key_id": key, "root": root_hex}
+                "transient": True, "age_days": round(age, 2) if age is not None else None,
+                "reasons": [reason], "signer_key_id": key, "root": root_hex}
 
     try:
         cid = p["act"]["timestamp_token_cid"]
         manifest = fetch_manifest(cid, gateways)
     except Exception as e:
-        return pending(f"manifesto ainda não recuperável no IPFS ({e}) — propagação, não defeito")
+        return pending(f"manifesto ainda não recuperável no IPFS ({e})")
+
+    # Conferências SEM REDE ANTES do fetch da CA (Hetzner #3, achado 1): a root do manifesto == a root
+    # do /verify (que a inclusão já provou) E esta folha está entre as folhas do manifesto. Como o
+    # `tsa_ca_url` vem de DENTRO do próprio manifesto, deixar isto DEPOIS do fetch da CA deixava um
+    # servidor publicar root divergente + FreeTSA fora = silêncio (exit 0). Falha aqui é ALARME real,
+    # independe da CA.
+    hard: list[str] = []
+    if (manifest.get("root_hash_sha256") or "").lower() != root_hex:
+        hard.append("root do /verify != root do manifesto")
+    if declared_leaf not in {act.leaf_hash(x) for x in manifest.get("leaves", [])}:
+        hard.append("esta folha NÃO está entre as folhas do manifesto")
+    if hard:
+        return {"status": "error", "ok": False, "alarm": True, "reasons": hard,
+                "signer_key_id": key, "root": root_hex}
+
+    # CA (rede — transiente; mas as conferências sem-rede acima já passaram).
     try:
         ca_url = manifest.get("tsa_ca_url")
         ca_pem = _fetch(ca_url) if ca_url else b""
     except Exception as e:
-        return pending(f"CA da TSA ainda não recuperável ({e}) — propagação/rede")
+        return pending(f"CA da TSA ainda não recuperável ({e})")
 
-    # manifesto E CA baixados → verifica o último elo DE VERDADE (aqui um erro É alarme).
+    # openssl (precisa da CA): o carimbo RFC 3161 sobre a root. Um erro aqui É alarme.
     manifest_res = act.verify_batch_manifest(
         manifest, ca_pem, None,
         expected_schema=SIG_BATCH_SCHEMA, expected_leaf_schema=SIG_LEAF_SCHEMA,
     )
-    if not manifest_res.get("ok"):
-        reasons.append("manifesto não confere: " + "; ".join(manifest_res.get("reasons", []) or ["root/carimbo"]))
-    if (manifest.get("root_hash_sha256") or "").lower() != root_hex:
-        reasons.append("root do /verify != root do manifesto")
-    leaf_in_manifest = declared_leaf in {act.leaf_hash(x) for x in manifest.get("leaves", [])}
-    if not leaf_in_manifest:
-        reasons.append("esta folha NÃO está entre as folhas do manifesto")
-
-    ok = manifest_res.get("ok") and leaf_in_manifest and not reasons
+    ok = bool(manifest_res.get("ok"))
+    reasons = [] if ok else [
+        "manifesto/carimbo não confere: " + "; ".join(manifest_res.get("reasons", []) or ["root/carimbo"])
+    ]
     return {
         "status": "verified" if ok else "error",
-        "ok": bool(ok),
-        "alarm": False,
+        "ok": ok,
+        "alarm": not ok,
         "reasons": reasons,
         "signer_key_id": key,
         "root": root_hex,
@@ -295,6 +313,8 @@ def main() -> int:
             print(f"  {g}✓{x} {key}  carimbada {dim}({res.get('gen_time')}, {res.get('provider')}/{res.get('legal_profile')}){x}")
         elif st == "verified_pending_manifest":
             print(f"  {y}✓{x} {key}  incluída na root {g}(prova fecha){x} {dim}— manifesto ainda propagando no IPFS, retry{x}")
+        elif st == "stale_pending_manifest":
+            print(f"  {r}!{x} {key}  {r}ALARME{x}: manifesto inalcançável há {res.get('age_days')}d — pin perdido, não propagação")
         elif st == "pending":
             print(f"  {y}…{x} {key}  pendente {dim}(há {res.get('age_days')}d — normal até ~{args.max_pending_days:g}d){x}")
         elif st == "stale_pending":
