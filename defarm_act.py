@@ -249,18 +249,30 @@ def token_cert_fingerprints(token_der: bytes) -> list[str]:
     return fps
 
 
-def verify_batch_manifest(manifest: dict, ca_pem: bytes, tsa_cert_pem: bytes | None) -> dict:
-    """A prova órfã COMPLETA do C2, a partir do manifesto IPFS (defarm.act_timestamp_batch.v1):
+def verify_batch_manifest(
+    manifest: dict,
+    ca_pem: bytes,
+    tsa_cert_pem: bytes | None,
+    *,
+    expected_schema: str = EXPECTED_BATCH_SCHEMA,
+    expected_leaf_schema: str = EXPECTED_LEAF_SCHEMA,
+    expected_root_alg: str = EXPECTED_ROOT_ALG,
+) -> dict:
+    """A prova órfã COMPLETA a partir do manifesto IPFS:
       1. recusa cedo se schema/root_alg/leaf_schema forem desconhecidos (não sei reproduzir);
-      2. recompõe a daily_root das FOLHAS e confere == root declarada;
+      2. recompõe a root das FOLHAS e confere == root declarada;
       3. confere o carimbo RFC 3161 (modo -digest) sobre a root: imprint == root, assinatura, cadeia.
-    Se os três passam, a root está carimbada por uma TSA cuja cadeia confere — SEM a DeFarm."""
+    Se os três passam, a root está carimbada por uma TSA cuja cadeia confere — SEM a DeFarm.
+
+    Os schemas esperados são parâmetros (default = os do C2/content_root) pra o MESMO verificador
+    servir o domínio D3 (`signature_root`): a árvore, o JCS e a verificação RFC 3161 são idênticos —
+    só o rótulo do lote/folha muda. Reusar aqui evita duas cópias da mesma verificação (classe #504)."""
     reasons: list[str] = []
-    if manifest.get("schema") != EXPECTED_BATCH_SCHEMA:
+    if manifest.get("schema") != expected_schema:
         reasons.append(f"schema do manifesto desconhecido: {manifest.get('schema')!r}")
-    if manifest.get("root_alg") != EXPECTED_ROOT_ALG:
+    if manifest.get("root_alg") != expected_root_alg:
         reasons.append(f"root_alg desconhecido (não sei reproduzir): {manifest.get('root_alg')!r}")
-    if manifest.get("leaf_schema") != EXPECTED_LEAF_SCHEMA:
+    if manifest.get("leaf_schema") != expected_leaf_schema:
         reasons.append(f"leaf_schema desconhecido: {manifest.get('leaf_schema')!r}")
     if reasons:
         return {"ok": False, "reasons": reasons}
