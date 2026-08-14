@@ -123,6 +123,19 @@ python3 defarm_sig_ts.py --verify-url https://.../api/verify/<DFID> --json
 > dia que **não carimbou** (worker parado, ou a margem subida em produção). O canário **sai `!= 0`**
 > nesse caso, para um monitor gritar em vez de "pendente há 3 dias" parecer normal.
 
+> **Propagação ≠ defeito.** Logo após carimbar (fluxo one-shot), o `/verify` já diz `timestamped` mas
+> o manifesto recém-pinado leva **minutos** para resolver num gateway IPFS público. A prova de inclusão
+> **já fecha só com o JSON** (leaf + siblings), então o canário reporta `verified_pending_manifest`
+> (`✓ incluída na root`) e **NÃO sai `!= 0`** — o último elo (recompor a root inteira + `openssl`) é um
+> **retry**, não um alarme. Um canário que grita por propagação vira ruído. Para exigir o manifesto
+> recuperável AGORA (canário estrito, rodado depois da propagação), passe `--require-manifest`.
+>
+> **Ressalva — o transiente tem TETO.** Propagação é minutos; um manifesto inalcançável há **mais** que
+> `--max-pending-days` **não** é propagação, é **pin perdido** → o canário reporta `stale_pending_manifest`
+> e **sai `!= 0`** (senão "pendente para sempre" repete o silêncio no último elo). A idade é a do **PIN**
+> (`proof.act.issued_at`, o genTime do carimbo), NÃO a do anexo — um pin de 7 s de uma assinatura
+> antiga (backfill/replay) segue transiente, não vira falso alarme.
+
 ## Uso
 
 ```bash
